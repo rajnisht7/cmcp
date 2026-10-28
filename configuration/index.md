@@ -1,0 +1,200 @@
+# Configuration Reference
+
+This page lists every setting that controls how the cMCP gateway runs. It is for whoever installs and operates the gateway. You get an annotated example file, a table for each setting, and a checklist for production.
+
+Most settings live in one file, `cmcp-config.yaml`. It says which secure hardware to use for attestation (the hardware's signed proof of what software is running), whether a policy "deny" actually blocks a call, which network address to listen on, and where the policy and tool files are. Environment variables override some fields and carry values, such as tokens and approved file hashes, that should not sit in a config file.
+
+## Full example
+
+```
+# cmcp-config.yaml - annotated full example
+
+attestation:
+  # TEE provider. auto detects in order: azure-cvm -> tpm -> sev-snp -> tdx.
+  # Use software-only only with CMCP_DEV_MODE=1.
+  provider: auto
+
+  # enforcing: policy denies block the tool call and return HTTP 403.
+  # advisory: policy denies are logged but the call is forwarded.
+  # silent: like advisory but without operational log lines. The hash-chained
+  #   audit log still records every would-have-denied decision -- silent
+  #   quiets logs, never the evidence.
+  enforcement_mode: enforcing
+
+  # How long (in seconds) an attestation report is considered fresh.
+  # Default is 24 hours. When validity expires, the default behavior is
+  # fail_closed: active sessions are terminated until re-attestation.
+  validity_seconds: 86400
+
+  # fail_closed (default): terminate sessions when attestation expires.
+  # warn_only: allow sessions to continue; marks TRACE Claims as stale.
+  staleness_policy: fail_closed
+
+  # Optional. If set, the runtime verifies the TEE measurement matches
+  # this value at startup and refuses to start if it does not.
+  # Format: provider-specific (e.g., hex PCR values for TPM,
+  # AMD measurement register hex for SEV-SNP).
+  # expected_measurement: "sha256:..."
+
+agent_manifest:
+  # Optional signed Agent Manifest binding (#302). When set, the runtime
+  # verifies the manifest issuer signature, checks that the authenticated
+  # agent subject matches manifest.agent_id, and requires the manifest's
+  # policy/catalog hashes to match the loaded runtime hashes before sessions
+  # can be created.
+  path: ./agent-manifest.json
+  trust_anchor_path: ./manifest-public-key.json
+  authenticated_subject: spiffe://factory.example/agent/material-movement/dev
+
+catalog:
+  # fail_closed (default): deny calls when an upstream server advertises a
+  # changed or withdrawn approved tool definition.
+  # warn_only: route the call but record the drift in the audit chain and
+  # TRACE Claim so an operator can measure a rollout before enforcing.
+  drift_policy: fail_closed
+
+# Path to the directory containing .cedar policy files and manifest.json.
+# Must not contain '..' components. Relative paths are resolved from the
+# working directory at startup.
+policy_bundle_path: policies/
+
+# Path to the JSON tool catalog file.
+# Must not contain '..' components.
+catalog_path: catalog.json
+
+# Address and port the runtime listens on.
+# Effective defaults:
+# - tokenless CMCP_DEV_MODE=1: "127.0.0.1:8443"
+# - authenticated or production operation: "0.0.0.0:8443" (unless explicitly configured)
+# Tokenless development mode only accepts loopback addresses (e.g., 127.0.0.1:8443, localhost:8443, [::1]:8443).
+# Wildcard, LAN, public, and non-loopback hostname binds require CMCP_BEARER_TOKEN.
+listen_addr: "0.0.0.0:8443"
+
+# Maximum size of a tool response payload in bytes. Responses larger than
+# this are rejected before entering the response inspector (FM-5 size check).
+# Default is 2MB (2097152 bytes).
+max_response_size_bytes: 2097152
+
+# Interval in seconds between automatic policy bundle reloads.
+# 0 (default) disables automatic reload. Changing the policy bundle
+# without restarting the runtime invalidates the attestation measurement.
+# This field exists for advisory/silent deployments only; do not use in
+# enforcing mode without a full enclave restart.
+policy_reload_interval_seconds: 0
+```
+
+## Field reference
+
+### attestation
+
+| Field                  | Type    | Default       | Description                                                                                                                                                                                     |
+| ---------------------- | ------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`             | string  | `auto`        | TEE provider. Valid values: `auto`, `tpm`, `sev-snp`, `tdx`, `software-only`. `auto` detects in order: azure-cvm, then tpm, then sev-snp, then tdx. `software-only` requires `CMCP_DEV_MODE=1`. |
+| `enforcement_mode`     | string  | `enforcing`   | Policy enforcement mode. Valid values: `enforcing`, `advisory`, `silent`.                                                                                                                       |
+| `validity_seconds`     | integer | `86400`       | Attestation report validity period in seconds. Must be a positive integer. At expiry, behavior is controlled by `staleness_policy`.                                                             |
+| `staleness_policy`     | string  | `fail_closed` | Action when attestation validity expires. Valid values: `fail_closed` (terminate sessions), `warn_only` (allow sessions, mark claims as stale).                                                 |
+| `expected_measurement` | string  | none          | Optional. Expected TEE measurement value. If set, the runtime verifies the hardware measurement matches this string at startup and exits with a non-zero status if it does not.                 |
+
+### agent_manifest
+
+An Agent Manifest is a signed document that declares which agent this is and which policy and tool catalog it was approved with. Setting this block makes the gateway check that manifest before it accepts any session.
+
+All fields are optional as a group. If `path` is set, `trust_anchor_path` must also be set. When the block is configured, cMCP fails closed on manifest signature failure, a signing key not authorized for the manifest's issuer, subject mismatch, policy hash drift, or catalog hash drift.
+
+| Field                   | Type   | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ----------------------- | ------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `path`                  | string | none    | Path to the signed Agent Manifest JSON document. Path traversal (`..` components) is rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `trust_anchor_path`     | string | none    | Path to a JSON trust anchor containing the issuer Ed25519 public key and the issuers it may sign for, either as `{ "key_id": "...", "public_key_base64url": "...", "issuers": ["spiffe://..."] }` or `{ "keys": [...] }` with the same fields per key. `issuers` is required (Agent Manifest spec §5.3.3): a trust anchor in which no key lists `issuers` stops startup with `AGENT_MANIFEST_BINDING_FAILED`, and a key that does not list the manifest's `issuer` is not authorized to sign it. Each issuer must be a well-formed SPIFFE ID (no userinfo, port, query or fragment), and a repeated `key_id` is refused. |
+| `authenticated_subject` | string | none    | SPIFFE URI for the authenticated agent subject. This must equal `manifest.agent_id`. In production this should come from the agent SVID/mTLS identity; the config field is the current runtime input for that subject.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `revocation_list_path`  | string | none    | Path to a JSON Lines revocation list, one record per line with `manifest_id`, `revoked_at`, `reason` and `revoked_by` (the format `manifest revoke` writes and `manifest verify --crl-path` reads). A manifest listed there fails startup. A missing, unreadable or malformed file also fails startup rather than being read as empty. Requires `path`. Without it, revocation is not checked and startup logs a warning. The list is read at startup only, so a revocation added later takes effect on the next restart.                                                                                                |
+
+### catalog
+
+The catalog is your approved list of tools and what each one looks like. The gateway compares what a tool server says it offers with that approved list once per server per session, the first time it connects. Any difference ("drift") is always written to the audit chain (the tamper-evident log) and the TRACE Claim (the signed session record); this setting decides whether the session is also blocked.
+
+| Field          | Type   | Default       | Description                                                                                                                                                                        |
+| -------------- | ------ | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `drift_policy` | string | `fail_closed` | Action when an approved tool definition changed or was withdrawn. Valid values: `fail_closed` (deny calls in the session) and `warn_only` (route calls while recording the drift). |
+
+### top-level fields
+
+| Field                            | Type            | Default        | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------- | --------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `policy_bundle_path`             | string          | `policies/`    | Path to the Cedar policy bundle directory. Must contain `.cedar` files and a `manifest.json`. Path traversal (`..` components) is rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `catalog_path`                   | string          | `catalog.json` | Path to the JSON tool catalog. Path traversal (`..` components) is rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `listen_addr`                    | string          | `0.0.0.0:8443` | Address and port the gateway binds to. Default is `127.0.0.1:8443` in tokenless `CMCP_DEV_MODE=1`, otherwise `0.0.0.0:8443`. Tokenless dev mode requires loopback (e.g., `127.0.0.1:8443`, `localhost:8443`, `[::1]:8443`). Wildcard, LAN, public, and non-loopback hostname binds require `CMCP_BEARER_TOKEN`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `session_state_path`             | string or unset | unset          | Path to the SQLite session-state database. Startup opens this store and connects it to the gateway; writes for the same session identifier are serialised with `BEGIN IMMEDIATE`. **Restarting the gateway or sharing the database does not restore the same logical session.** Authenticated session resumption remains separate work tracked in #653. Unset keeps state in the gateway process. Must be a non-blank string; path traversal (`..` components) is rejected. **A configured path that cannot be opened aborts startup** (`SESSION_STATE_STORE_UNAVAILABLE`).                                                                                                                                                                                                                                                          |
+| `max_response_size_bytes`        | integer         | `2097152`      | Maximum tool response size in bytes (2MB). Must be a positive integer. Responses exceeding this limit are rejected before inspection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `policy_reload_interval_seconds` | integer         | `0`            | Interval in seconds between automatic Cedar bundle reloads. `0` disables automatic reload. Above `0` requires a pinned `CMCP_POLICY_SIGNING_KEY`: **an interval alongside only a pinned `CMCP_POLICY_HASH` aborts startup** (`POLICY_RELOAD_PINNED_HASH`): the reload re-validates against that pinned hash, so a bundle that actually changed would always be rejected and the old policy would stay in force. A hash pins one artifact and so cannot authorise a bundle that changed; a signing key approves any bundle the authority signs, which is what reload needs. Both pins together is the supported production shape: the hash is checked on the startup load, and with a key pinned the reloads are authorised by the key alone. See [Policy Hot-Reload](https://cmcp.agentrust-io.com/spec/policy-hot-reload/index.md). |
+| `conformance_profile`            | string or unset | unset          | A named profile that tightens defaults which stay permissive for developers. Only `aarm` is defined: it requires an Agent Manifest binding, because AARM R6 says every receipt MUST be bound to an agent identity while the developer default leaves binding optional. With it set, the gateway refuses to start unless `agent_manifest.path` and `agent_manifest.trust_anchor_path` are configured (`CONFORMANCE_PROFILE_UNSATISFIED`). An unrecognised name is a config error rather than a profile that enforces nothing.                                                                                                                                                                                                                                                                                                         |
+
+## Environment variables
+
+Environment variables control secrets and mode flags that must not appear in config files. They are read once at process startup; they cannot be changed at runtime.
+
+Two of them decide who may approve a new policy while the gateway is running. `CMCP_POLICY_SIGNING_KEY` is the public key whose signature a new policy bundle needs, and `CMCP_POLICY_SUCCESSOR_SIGNING_KEY` is a backup key that can take over if the first one is compromised.
+
+Technical detail: policy signing keys
+
+`CMCP_POLICY_SIGNING_KEY` is the raw Ed25519 **public** key (base64url or hex, 32 bytes) permitted to sign policy bundles. Pinning it is what allows `policy_reload_interval_seconds > 0`: a bundle is installed at runtime only when its `manifest.signature` verifies under this key and its `manifest.version` increased. It is public, yet security-critical, which is why it sits here with `CMCP_POLICY_HASH` rather than in the config file.
+
+`CMCP_POLICY_SUCCESSOR_SIGNING_KEY` is an optional second Ed25519 public key, same format, that must differ from `CMCP_POLICY_SIGNING_KEY` and is refused without it (`POLICY_SIGNING_KEY_INVALID`). It signs no bundle while the current key is trusted. Its use is to revoke the current key on a running gateway: put a statement signed by the successor's private key in `signing-key-revocations.json` in the bundle directory, and on the next reload the current key is revoked and the successor becomes the key bundles must be signed by. Keep the successor's private key apart from the current one, since a statement signed by a stolen current key can only hand control to the successor. Without a successor pinned, the current key can still revoke itself, which leaves no trusted key and refuses every tool call until a restart with a new key. After a revocation, set `CMCP_POLICY_SIGNING_KEY` to the successor before the next restart; revocation state is kept in memory, and a restart rebuilds it from these variables plus whatever statement file is on disk. The statement format is in [Policy Hot-Reload](https://cmcp.agentrust-io.com/spec/policy-hot-reload/#revocation-without-a-restart).
+
+| Variable              | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Overrides                                     |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `CMCP_DEV_MODE=1`     | Enables software-only attestation. No hardware TEE required. TRACE Claims will show `partially_verified` status. Required when `provider` is `software-only`.                                                                                                                                                                                                                                                                                                                                                          | `attestation.provider` (forces software-only) |
+| `CMCP_BEARER_TOKEN`   | Optional bearer token for runtime HTTP auth. If set, all requests to the runtime must include `Authorization: Bearer <token>`. If unset, no bearer auth is enforced. This token is required for non-loopback binds.                                                                                                                                                                                                                                                                                                    | none                                          |
+| `CMCP_OPERATOR_TOKEN` | Credential for the operator interface: `POST /sessions/{id}/reset` and `POST /catalog/exception`. Required outside `CMCP_DEV_MODE=1` (`OPERATOR_TOKEN_REQUIRED`), and must differ from `CMCP_BEARER_TOKEN`. When set, those two routes accept only this token and reject the tool-invocation token; when unset they fall back to `CMCP_BEARER_TOKEN`. A reset lowers accumulated session sensitivity, so an agent host holding only the tool-invocation token cannot clear the state that monotonicity exists to keep. | none                                          |
+| `CMCP_POLICY_HASH`    | SHA-256 hash of the approved policy bundle. Required in non-dev mode and checked by startup before Agent Manifest binding. The gateway fails closed at startup if this is unset and `CMCP_DEV_MODE` is not `1`. Format: `sha256:<hex>`.                                                                                                                                                                                                                                                                                | none (startup policy integrity check)         |
+| `CMCP_CATALOG_HASH`   | SHA-256 hash of the approved `catalog.json`. Required in non-dev mode. The gateway fails closed at startup if this is unset and `CMCP_DEV_MODE` is not `1`. Format: `sha256:<hex>`.                                                                                                                                                                                                                                                                                                                                    | none (additional startup check)               |
+
+The catalog is immutable for the process lifetime. Updating routing, tool definitions, TLS pins, or measured child identities requires a new pinned hash and a gateway restart. Hot-reload configuration is rejected with `CATALOG_RESTART_REQUIRED`; see [Catalog lifecycle](https://cmcp.agentrust-io.com/spec/catalog-lifecycle/index.md).
+
+## Enforcement modes
+
+The enforcement mode decides what happens when your policy says no to a tool call: block it, or let it through and record that it would have been blocked. Start with `advisory` while you tune a new policy, then switch to `enforcing`.
+
+| Mode        | Behavior                                                                                                                                                                                                                                                                                                      | Use case                                                                                                                                             |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enforcing` | Policy denies block the tool call. The runtime returns HTTP 403 and a structured error to the agent. The call is not forwarded to the upstream server.                                                                                                                                                        | Production. Default for new deployments.                                                                                                             |
+| `advisory`  | Policy denies are logged in the audit chain but the call is forwarded. The TRACE Claim records the deny. No tool call is blocked.                                                                                                                                                                             | Policy testing, migration from existing runtime. Safe for first run with an untuned policy.                                                          |
+| `silent`    | Policy is evaluated, the call is forwarded, and **the audit chain still records every would-have-denied decision** (as `advisory_deny`, visible in the TRACE Claim's call summary). The only difference from `advisory` is that no operational log lines are emitted. Silent quiets logs, never the evidence. | Measuring policy impact before rollout without operational log noise. The tamper-evident record remains complete, so post-hoc review stays possible. |
+
+### Silent-mode audit contract
+
+`enforcing` is the default and must be configured explicitly to use any other mode. In short, silent mode turns off the gateway's ordinary log messages about denied calls but never removes them from the tamper-evident audit log.
+
+In `silent` mode, `PolicyEvaluator` suppresses application-level log lines for denied tool calls but still returns `would_have_denied=True` in the `PolicyDecision`. The proxy writes an `advisory_deny` entry into the hash-chained audit log for every call that would have been denied. The audit chain records evidence even in silent mode. Only operational logs are quiet; the tamper-evident record remains complete and available for post-hoc review.
+
+## Minimal working config
+
+```
+attestation:
+  provider: auto
+  enforcement_mode: enforcing
+policy_bundle_path: policies/
+catalog_path: catalog.json
+```
+
+With `CMCP_DEV_MODE=1` for local development:
+
+```
+attestation:
+  provider: auto
+  enforcement_mode: advisory
+policy_bundle_path: ./policies/
+catalog_path: ./catalog.json
+```
+
+## Production hardening checklist
+
+Do these before you rely on the gateway for real traffic. Each item closes a gap that the developer defaults leave open.
+
+An optional `sink_policy` sets a hard upper limit on how sensitive the data sent to each tool, or returned to the caller, may be, and it applies even when Cedar runs in advisory mode. It also keeps error output captured from local (stdio) tool servers out of the logs. See [sink sensitivity ceilings](https://cmcp.agentrust-io.com/spec/sink-policy/index.md) for configuration, classification assumptions, and the remaining audit/log limits.
+
+- Set `attestation.enforcement_mode` to `enforcing`. Advisory mode provides no blocking protection against policy violations.
+- Set `CMCP_CATALOG_HASH` to the SHA-256 of the approved `catalog.json`. The gateway fails closed at startup if this is unset in non-dev mode, but setting it explicitly pins the approved catalog hash and prevents silent substitution.
+- Configure `agent_manifest.path`, `agent_manifest.trust_anchor_path`, and `agent_manifest.authenticated_subject` for agents with signed manifests. The runtime will refuse to start if the signed manifest does not bind the authenticated agent subject to the loaded policy bundle and catalog hashes.
+- Set `attestation.expected_measurement` to the expected TEE measurement for your deployment. Without this, a different binary could be deployed and would still produce valid attestation reports.
+- Use a real TEE provider (`tpm`, `sev-snp`, or `tdx`), not `software-only`. Software-only mode has no hardware root of trust (nothing in the chip vouches for the software), and it leaves threat classes T1 through T4 in the [specification's threat model](https://cmcp.agentrust-io.com/SPEC/#formal-threat-classes) open.
+- Rotate the TEE signing key by performing a full enclave restart on a regular schedule. The signing key is hardware-sealed per enclave instance; rotation requires restart.

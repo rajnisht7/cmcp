@@ -1,0 +1,474 @@
+# Quickstart - cMCP Runtime
+
+This is the hands-on first run of cMCP, for developers who want to see it work on their own computer. In under 30 minutes you watch the gateway block one tool call, allow another, and hand you a signed receipt of the session (a TRACE Claim) that you then check. It uses `CMCP_DEV_MODE=1`, so you do not need a TEE (trusted execution environment, the sealed-off hardware cMCP can run on in production).
+
+______________________________________________________________________
+
+## What you'll build
+
+You'll run the cMCP gateway, send it tool calls the way an agent would, and let a small set of rules written in Cedar (a policy language) decide each one. You'll see two outcomes:
+
+1. **Block** a call to a sensitive tool (`salesforce.contacts`). The gateway returns HTTP 403 and the call never reaches any upstream.
+1. **Allow** a call to a non-sensitive tool (`echo`) and forward it to a small mock upstream.
+
+At the end you close the session and get a signed TRACE Claim that records both calls, which policy decided each one, and the policy bundle hash measured at startup. You inspect its signature and consistency. This software demo does not establish hardware provenance, and without a hardware TEE the runtime gives no isolation from the host it runs on.
+
+______________________________________________________________________
+
+## Prerequisites
+
+- Python 3.11+, pip, and curl
+- Bash on Linux, macOS, or Windows with WSL
+- Three terminal windows: gateway, client requests, and mock tool server
+
+Expected finish: one `403 POLICY_DENY`, one `200 OK`, and `cmcp verify` reporting `partially_verified` with exit code 1. No Salesforce account or real personal data is used.
+
+Verify:
+
+```
+python3 --version   # Python 3.11.x or higher
+pip --version
+```
+
+______________________________________________________________________
+
+## Install
+
+```
+python3 -m venv cmcp-env
+source cmcp-env/bin/activate
+python3 -m pip install cmcp-runtime==0.7.0
+```
+
+The install is pinned so the commands and outputs below match what you run. CI runs this page end to end against that release on every docs change.
+
+This installs:
+
+- `cmcp` - the gateway CLI
+- `cmcp_verify` - the Python library for verifying TRACE Claims (no separate CLI install needed)
+
+### Termux (Android)
+
+`pip install cmcp-runtime` fails to build two dependencies on Termux/ARM out of the box.
+
+**1. cedarpy/maturin cannot detect the Android API level.** Fix: `export ANDROID_API_LEVEL=$(getprop ro.build.version.sdk)` before installing.
+
+**2. pynacl fails to build against libsodium.** Fix: `pkg install libsodium pkg-config` then `export SODIUM_INSTALL=system SODIUM_LIB_DIR=$PREFIX/lib SODIUM_INC_DIR=$PREFIX/include`.
+
+With both fixes set, `pip install cmcp-runtime` completes normally.
+
+______________________________________________________________________
+
+## Configuration
+
+Create a working directory for the demo:
+
+```
+mkdir cmcp-quickstart && cd cmcp-quickstart
+mkdir policies
+```
+
+Write `cmcp-config.yaml`:
+
+```
+attestation:
+  provider: auto
+  enforcement_mode: enforcing
+policy_bundle_path: ./policies/
+catalog_path: ./catalog.json
+listen_addr: "127.0.0.1:8443"
+audit_db_path: ./audit.db
+```
+
+- `provider: auto` uses protected hardware (a TEE) if the machine has one, and falls back to software-only when `CMCP_DEV_MODE=1`
+- `enforcement_mode: enforcing` means a policy deny returns HTTP 403 and the call is not forwarded. Use `advisory` instead if you want denies logged but not blocked while you tune a new policy.
+- `policy_bundle_path` is the folder holding your rules (`.cedar` files) and `manifest.json`, together called the policy bundle
+- `catalog_path` is the JSON file listing approved tools
+
+______________________________________________________________________
+
+## Cedar policy
+
+Write `policies/manifest.json`:
+
+```
+{
+  "version": "0.1.0",
+  "authored_at": "2026-06-05T00:00:00Z",
+  "author_identity": "developer@example.com",
+  "commit_sha": "quickstart-demo"
+}
+```
+
+Write `policies/demo.cedar`:
+
+```
+// Rule 1: permit calls from the demo-agent workflow.
+permit (
+  principal,
+  action,
+  resource
+) when {
+  context.workflow_id == "demo-agent"
+};
+
+// Rule 2: block the sensitive tool by resource name. forbid overrides permit,
+// so this call is denied at the gateway and never reaches any upstream.
+forbid (
+  principal,
+  action,
+  resource == Resource::"salesforce.contacts"
+);
+```
+
+The gateway builds the Cedar `resource` from the tool name, so `resource == Resource::"salesforce.contacts"` matches a call to that tool. Cedar evaluates `forbid` before `permit`, so rule 2 wins when both match. Rule 1 scopes everything else to the `demo-agent` workflow.
+
+Write `policies/schema.cedarschema` (one line):
+
+```
+{"cMCP":{"entityTypes":{"Principal":{"memberOfTypes":[],"shape":{"type":"Record","attributes":{"session_id":{"type":"String","required":true},"workflow_id":{"type":"String","required":true}}}},"Resource":{"memberOfTypes":[],"shape":{"type":"Record","attributes":{"tool_name":{"type":"String","required":true}}}}},"actions":{"call_tool":{"appliesTo":{"principalTypes":["cMCP::Principal"],"resourceTypes":["cMCP::Resource"],"context":{"type":"Record","attributes":{"session_max_sensitivity":{"type":"String","required":true},"workflow_id":{"type":"String","required":true}}}}}}}}
+```
+
+______________________________________________________________________
+
+## Catalog
+
+Write `catalog.json`. The catalog is the list of tools the gateway is allowed to forward to, with an approved description of each. It lists two tools: `salesforce.contacts` (sensitive, the policy blocks it) and `echo` (non-sensitive, the policy allows it). Both point at the mock upstream you start below.
+
+Each entry carries a `definition_hash`, a fingerprint of the approved tool description, so the gateway can notice if a tool server later changes what it claims to do. Technically it is the SHA-256 of the canonical JSON of `approved_definition` (sorted keys, no whitespace, ASCII-safe). The values below are precomputed to match.
+
+```
+[
+  {
+    "tool_name": "salesforce.contacts",
+    "server": {
+      "display_name": "Salesforce Contacts MCP Server (mock)",
+      "url": "http://localhost:9001/mcp",
+      "tls_fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "transport": "http-sse"
+    },
+    "approved_definition": {
+      "description": "Query Salesforce contacts by account name or contact ID.",
+      "input_schema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {"type": "string", "description": "Account name or contact ID"},
+          "max_records": {"type": "integer", "default": 50}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "contacts": {"type": "array"},
+          "total_count": {"type": "integer"}
+        }
+      }
+    },
+    "definition_hash": "sha256:b42ecf14612f23456b5b0794864a00288d4038ac444cedb87fc214cefee89e35",
+    "compliance_domain": "pii",
+    "requires_baa": false,
+    "sensitivity_level": "pii",
+    "added_at": "2026-06-05T00:00:00Z",
+    "approved_by": "developer@example.com"
+  },
+  {
+    "tool_name": "echo",
+    "server": {
+      "display_name": "Echo MCP Server (mock)",
+      "url": "http://localhost:9001/mcp",
+      "tls_fingerprint": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+      "transport": "http-sse"
+    },
+    "approved_definition": {
+      "description": "Returns its input unchanged. For testing only.",
+      "input_schema": {"type": "object", "properties": {"message": {"type": "string"}}},
+      "output_schema": {"type": "object", "properties": {"message": {"type": "string"}}}
+    },
+    "definition_hash": "sha256:130436578985268754fd1925a01a7a12e2f94bcfd439f4f43050f816f866e8d6",
+    "compliance_domain": "public",
+    "requires_baa": false,
+    "sensitivity_level": "public",
+    "added_at": "2026-06-05T00:00:00Z",
+    "approved_by": "developer@example.com"
+  }
+]
+```
+
+The `tls_fingerprint` values above are placeholders (they only need to match the `SHA256:<base64>` format for the demo). If you change any field in an `approved_definition`, recompute its `definition_hash`; the runtime rejects catalog entries where the hash does not match:
+
+```
+python3 -c "
+import json, hashlib
+d = {
+  'description': 'Returns its input unchanged. For testing only.',
+  'input_schema': {'type': 'object', 'properties': {'message': {'type': 'string'}}},
+  'output_schema': {'type': 'object', 'properties': {'message': {'type': 'string'}}}
+}
+s = json.dumps(d, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+print('sha256:' + hashlib.sha256(s.encode()).hexdigest())
+"
+```
+
+______________________________________________________________________
+
+## Confirm your setup
+
+First check the YAML configuration:
+
+```
+cmcp validate-config --config cmcp-config.yaml
+```
+
+Expect `✓ Config valid: cmcp-config.yaml`. This command checks the YAML; it does not load the policy bundle and tool catalog. Check those inputs and record their expected hashes **before** starting the gateway:
+
+```
+python3 - <<'PY'
+import json
+from pathlib import Path
+from cmcp_runtime.policy.bundle import load_policy_bundle
+from cmcp_runtime.catalog.loader import load_catalog
+
+approved = {
+    "policy_bundle_hash": load_policy_bundle("policies").bundle_hash,
+    "tool_catalog_hash": load_catalog("catalog.json").catalog_hash,
+}
+Path("approved-hashes.json").write_text(json.dumps(approved, indent=2))
+print(json.dumps(approved, indent=2))
+PY
+```
+
+This checks the input files and writes `approved-hashes.json`: fingerprints of the rules and tool list you just approved. You will compare the receipt against it at the end. Keep it unchanged while running the demo. In production, work these values out from reviewed files and give them to whoever checks receipts through a channel that person controls.
+
+______________________________________________________________________
+
+## Start the runtime
+
+```
+CMCP_DEV_MODE=1 cmcp start --config cmcp-config.yaml
+```
+
+In dev mode the runtime uses a software stand-in where the hardware check would go (a software-only TEE provider), so no special machine is needed. You will see a few informational warnings before it starts listening. These are expected in dev mode and do not mean anything is broken:
+
+```
+No hardware TEE detected. Running in development mode: attestation is not hardware-backed. ...
+SPIFFE SVID not available (SPIRE agent socket not found ...) - gateway will use self-signed TLS for mTLS
+CMCP_NRAS_API_KEY is not set -- skipping NRAS post-attestation appraisal. ...
+cMCP Runtime starting: TEE: software-only, listen: 127.0.0.1:8443
+INFO:     Uvicorn running on http://127.0.0.1:8443 (Press CTRL+C to quit)
+```
+
+Without a token, dev mode only listens on your own machine (loopback). Reaching the gateway from a LAN, a container network, or the cloud requires setting `CMCP_BEARER_TOKEN`, so you never expose a gateway that anyone can call by accident.
+
+The gateway now holds this terminal open. Leave it running and open a **second terminal** for the next steps. In that second terminal, `cd` back into `cmcp-quickstart` (and re-activate your Python environment if you use one) so the commands run from the right place.
+
+______________________________________________________________________
+
+## Make a blocked call
+
+In the second terminal, call the sensitive tool. The policy forbids it, so the gateway denies it before contacting any upstream:
+
+```
+curl -i -X POST http://localhost:8443/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "salesforce.contacts",
+      "arguments": {"query": "Acme Corp", "max_records": 10},
+      "_cmcp": {"session_id": "demo-session-001", "workflow_id": "demo-agent"}
+    }
+  }'
+```
+
+You get back `HTTP/1.1 403 Forbidden` and a JSON-RPC error:
+
+```
+{"jsonrpc": "2.0", "error": {"code": -32000, "message": "Request denied by policy", "data": {"error_code": "POLICY_DENY", "call_id": "..."}}, "id": 1}
+```
+
+This is the point of the gateway: the sensitive call was stopped at the policy boundary. No upstream needed to be running for this to work.
+
+______________________________________________________________________
+
+## Make an allowed call
+
+Now the `echo` tool, which the policy permits. An allowed call is passed on to the tool server (the upstream), so start a small stand-in (mock) tool server first.
+
+If you cloned the repo, run the bundled one in Terminal 3, replacing `/path/to/cmcp` with your checkout path:
+
+```
+python3 /path/to/cmcp/scripts/mock_upstream.py --port 9001
+```
+
+If you only installed the package, write a compact mock into a file and run it:
+
+```
+cat > mock_upstream.py <<'PY'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        msg = json.loads(self.rfile.read(n) or b"{}")
+        body = json.dumps({"jsonrpc": "2.0", "id": msg.get("id"),
+                           "result": {"content": [{"type": "text", "text": "mock response"}]}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+print("mock upstream listening on :9001", flush=True)
+HTTPServer(("127.0.0.1", 9001), H).serve_forever()
+PY
+python3 mock_upstream.py
+```
+
+The mock holds its terminal open too, so run it in a **third terminal** (or background it). Then, back in the second terminal, make the allowed call:
+
+```
+curl -i -X POST http://localhost:8443/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "echo",
+      "arguments": {"message": "hello"},
+      "_cmcp": {"session_id": "demo-session-001", "workflow_id": "demo-agent"}
+    }
+  }'
+```
+
+You get `HTTP/1.1 200 OK` and the mock's response. The policy permitted the call (rule 1 matched on `workflow_id`), the gateway recorded an audit entry, and forwarded to the upstream.
+
+______________________________________________________________________
+
+## Get the TRACE Claim
+
+The TRACE Claim is the signed receipt for the whole session. It is finalized and signed when the session is **closed**. Closing takes the session's internal id (a UUID), not the `_cmcp.session_id` label (`demo-session-001`) you sent with the call. The allowed call's response body carries that id in `result._cmcp.session_id`. Copy it from the output above, then close the session:
+
+```
+# 1. The internal id from the allowed call's result._cmcp.session_id
+SESSION_UUID="<session id from the allowed call>"
+
+# 2. Close the session; this returns the signed TRACE Claim
+curl -s -X POST "http://localhost:8443/sessions/$SESSION_UUID/close" \
+  | python3 -m json.tool > claim.json
+```
+
+The closed session's claim stays available at `GET /sessions/$SESSION_UUID/trace-claim`.
+
+The `gateway.call_summary` in `claim.json` records both calls:
+
+```
+"call_summary": {
+  "tool_calls_total": 2,
+  "tool_calls_allowed": 1,
+  "tool_calls_denied": 1,
+  "tools_invoked": ["echo", "salesforce.contacts"]
+}
+```
+
+______________________________________________________________________
+
+## Verify
+
+Check the receipt with the bundled `cmcp verify` command; no code required. It confirms the signature is valid, the receipt has the right format, its evidence is recent, and the call log has not been altered, all without having to trust whoever ran the gateway. (In technical terms: the Ed25519 signature, schema, attestation freshness, and audit-chain consistency.)
+
+```
+cmcp verify claim.json
+```
+
+Expected output in dev mode:
+
+```
+CRYPTO-001: software-only (dev) mode -- TEE key binding cannot be verified; this claim provides no hardware provenance guarantee
+[cmcp verify] schema                   PASS
+[cmcp verify] signature                PASS
+[cmcp verify] policy_bundle.hash       PASS  (not pinned - pass --policy-hash to pin)
+[cmcp verify] tool_catalog.hash        PASS  (not pinned - pass --catalog-hash to pin)
+[cmcp verify] attestation_freshness    PASS
+[cmcp verify] audit_chain              PASS
+[cmcp verify] hardware_attestation     FAIL  software-only mode - not hardware-backed
+[cmcp verify] note: software-only mode - not hardware-backed
+[cmcp verify] RESULT: FAIL (partially_verified)
+```
+
+The `CRYPTO-001` line goes to stderr, ahead of the checks. It is an advisory, not a failure: the CLI is saying up front that a software-mode key binding proves nothing about hardware.
+
+`partially_verified` with exit code 1 is expected when the software checks pass and only hardware attestation is missing. Pin the expected policy and catalog hashes from the file you created before startup:
+
+```
+cmcp verify claim.json \
+  --policy-hash "$(python3 -c "import json; print(json.load(open('approved-hashes.json'))['policy_bundle_hash'])")" \
+  --catalog-hash "$(python3 -c "import json; print(json.load(open('approved-hashes.json'))['tool_catalog_hash'])")"
+```
+
+Taking expected hashes from the claim itself would not establish approval. These pins verify a match with your selected artifacts; they do not give the software claim hardware provenance.
+
+On a real TPM 2.0 host, pass a verifier-owned CA certificate bundle to authenticate the attestation-key chain:
+
+```
+cmcp verify claim.json --trusted-tpm-ca /etc/cmcp/trust/tpm-ca-roots.pem
+```
+
+The TPM trust bundle is necessary but not sufficient: the claim must also carry a valid signed quote and attestation-key evidence. This option is TPM-only; it does not configure AMD SEV-SNP or Intel TDX trust anchors.
+
+The `cmcp_verify` Python library is also available for programmatic checks (`from cmcp_verify import verify_trace_claim, ApprovedHashes`).
+
+______________________________________________________________________
+
+## What's in the TRACE Claim
+
+The receipt names the machine type, the rules that were loaded, how many calls were made and allowed, the key that signed it, and a fingerprint of the full call log.
+
+Technical detail: every field in the TRACE Claim
+
+| Field                               | What it records                                                                                                                                               |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trace.runtime.platform`            | Which TEE hardware produced the attestation report (`tpm2`, `amd-sev-snp`, etc.)                                                                              |
+| `trace.runtime.measurement`         | PCR/measurement recorded by hardware at enclave boot - all zeros in dev mode                                                                                  |
+| `trace.policy.bundle_hash`          | SHA-256 of the Cedar policy bundle loaded at startup - changing any policy file changes this hash                                                             |
+| `trace.policy.enforcement_mode`     | Whether policy denies are hard (`enforcing`) or logged-only (`advisory`)                                                                                      |
+| `trace.data_class`                  | Highest sensitivity level touched in the session                                                                                                              |
+| `trace.tool_transcript.hash`        | SHA-256 of the audit chain tip - binds the call log to this Trust Record                                                                                      |
+| `trace.tool_transcript.call_count`  | Number of tool calls in the session                                                                                                                           |
+| `trace.cnf.jwk`                     | Ed25519 public key used to sign this claim - bound to the TEE signing key                                                                                     |
+| `gateway.audit_chain.root` / `.tip` | Hash-chained audit log root and tip; verifying individual entries requires the exported audit bundle                                                          |
+| `gateway.call_summary`              | Per-session statistics: total, allowed, denied, faulted calls and tools invoked                                                                               |
+| `gateway.catalog.drift_detected`    | `true` if any tool definition changed after catalog load - signals a rug-pull attempt (a tool server quietly changing what a tool does after it was approved) |
+| `signature`                         | Ed25519 signature over canonical JSON of the entire claim body (excluding `signature`)                                                                        |
+
+______________________________________________________________________
+
+## If a step fails
+
+| Symptom                                        | What to check                                                                                                                              |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Connection refused` on port 8443              | The gateway terminal must still be running and must have printed `Uvicorn running on http://127.0.0.1:8443`.                               |
+| `cmcp: command not found`, or missing files    | Activate the virtual environment in every terminal, and run commands from the `cmcp-quickstart` folder.                                    |
+| The runtime cannot bind 127.0.0.1:8443         | A gateway from an earlier run still holds the port and would answer with its old policy. Stop it before starting this one.                 |
+| The blocked call returns `200 OK`              | Check `enforcement_mode: enforcing` and the `forbid` rule. Policy and catalog load at startup, so restart the gateway after changing them. |
+| The allowed call fails                         | The mock upstream must be listening on port 9001 in its own terminal.                                                                      |
+| The runtime rejects a catalog entry at startup | Its `definition_hash` no longer matches `approved_definition`. Recompute it with the snippet under Catalog.                                |
+| `FAIL (partially_verified)`, exit 1            | Expected when the six software checks pass and only `hardware_attestation` fails. Any other failing check needs investigation.             |
+
+______________________________________________________________________
+
+## Stop the demo
+
+Use Ctrl+C in the gateway and mock-server terminals. Keep `claim.json` and `approved-hashes.json` if you want to inspect the result later.
+
+## Next steps
+
+- **Full financial-services scenario**: see `examples/bfsi-demo/` for a multi-tool scenario with MNPI and PHI policies, cross-boundary events, and a KYC workflow.
+- **Spec reference**: see `docs/SPEC.md` for the full product specification and `docs/spec/` for individual component specs.
+- **Advisory mode**: set `enforcement_mode: advisory` in `cmcp-config.yaml`. Policy denies are logged and flagged in the claim (`would_have_denied`) but the call is still forwarded - useful while tuning a new policy.
+- **Hardware deployment**: follow the [TEE attestation guide](https://cmcp.agentrust-io.com/tutorials/tee-attestation/index.md) and [hardware validation record](https://cmcp.agentrust-io.com/testing/hardware-validation/index.md). Hardware placement alone does not guarantee `verified`; evidence, trust anchors, measurements, and freshness must pass the verifier's checks.
